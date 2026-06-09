@@ -139,24 +139,18 @@ for epoch in range(EPOCHS):
     epoch_test_acc, epoch_test_jc = [], []
     epoch_test_assd, epoch_test_hd95 = [], []
     index.append(epoch)
-
-    # Switch to the post-warmup stage. WEIGHTS will be updated below by TFWU.
     if epoch == WARMUP_EPOCH:
         USE_UNLABELED_CLIENT = True
-
     # Broadcast the global model to all clients
     copy_fed(CLIENTS, nets, fed_name='global')
-
-    # Local training on each client
+    # =====================================================
+    #   Pass 1: train all LABELED clients
+    # =====================================================
     for client, supervision_t in zip(CLIENTS, CLIENTS_SUPERVISION):
-        if supervision_t == 'unlabeled' and not USE_UNLABELED_CLIENT:
-            acc_train[client].append(0)
-            loss_train[client].append(0)
+        if supervision_t != 'labeled':
             continue
-
-        if client in ('Interobs', 'Lung1'):
+        if client in ('Interobs', 'Lung422'):
             continue
-
         acc_, loss_ = train_model(
             epoch, training_clients[client], optimizers[client], device,
             nets[client], nets['global'], ema_model=ema_net,
@@ -164,11 +158,50 @@ for epoch in range(EPOCHS):
             loss=loss_train[client], learning_rate=LR, iter_num=iter_nums)
         epoch_loss.append(loss_)
         epoch_train_acc.append(acc_)
-
-    loss_train1.append(sum(epoch_loss) / len(epoch_loss))
-    acc_train1.append(sum(epoch_train_acc) / len(epoch_train_acc))
-
-    # Global aggregation using WEIGHTS computed by TFWU in the previous round
+    # =====================================================
+    #   Compute cross-client cluster centers from the
+    #   updated labeled clients (only after warm-up)
+    # =====================================================
+    cluster_centers = None
+    if USE_UNLABELED_CLIENT:
+        proto_list, proto_weights = [], []
+        for i, client in enumerate(CLIENTS):
+            if CLIENTS_SUPERVISION[i] == 'labeled':
+                p = compute_class_prototypes(
+                    nets[client], training_clients[client],
+                    device, n_classes=2, max_batches=20)
+                if p is not None:
+                    proto_list.append(p)
+                    proto_weights.append(WEIGHTS[i])
+        if proto_weights:
+            s = sum(proto_weights)
+            proto_weights = [w / s for w in proto_weights]
+        cluster_centers = aggregate_prototypes(proto_list, proto_weights)
+    # =====================================================
+    #   Pass 2: train UNLABELED clients with CPL
+    # =====================================================
+    for client, supervision_t in zip(CLIENTS, CLIENTS_SUPERVISION):
+        if supervision_t != 'unlabeled':
+            continue
+        if not USE_UNLABELED_CLIENT:
+            # Still in warm-up: skip but record placeholders
+            acc_train[client].append(0)
+            loss_train[client].append(0)
+            continue
+        if client in ('Interobs', 'Lung422'):
+            continue
+        acc_, loss_ = train_model(
+            epoch, training_clients[client], optimizers[client], device,
+            nets[client], nets['global'], ema_model=ema_net,
+            acc=acc_train[client], supervision_type=supervision_t,
+            loss=loss_train[client], learning_rate=LR, iter_num=iter_nums,
+            cluster_centers=cluster_centers,
+            sigma=0.05, kernel_size=4, lambda_entropy=0.25)
+        epoch_loss.append(loss_)
+        epoch_train_acc.append(acc_)
+    loss_train1.append(sum(epoch_loss) / max(len(epoch_loss), 1))
+    acc_train1.append(sum(epoch_train_acc) / max(len(epoch_train_acc), 1))
+    # Global aggregation using TFWU weights from the previous round
     aggr_fed(CLIENTS, WEIGHTS, nets)
 
     # =====================================================
